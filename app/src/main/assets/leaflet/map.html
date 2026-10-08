@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <link rel="stylesheet" href="leaflet.css" />
+    <script src="leaflet.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        html, body {
+            height: 100%;
+            width: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: #e2edf7;
+        }
+        body.dark-mode {
+            background: #141414;
+        }
+        #map {
+            height: 100%;
+            width: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+            background: transparent;
+        }
+        .pulse-beacon {
+            width: 22px;
+            height: 22px;
+            background: #e53935;
+            border: 3px solid #ffffff;
+            border-radius: 50%;
+            box-shadow: 0 0 10px rgba(229, 57, 53, 0.9);
+            position: relative;
+        }
+        .pulse-beacon::after {
+            content: '';
+            position: absolute;
+            top: -11px;
+            left: -11px;
+            width: 38px;
+            height: 38px;
+            border-radius: 50%;
+            border: 2.5px solid #e53935;
+            animation: pulse-ring 1.8s infinite ease-out;
+        }
+        @keyframes pulse-ring {
+            0% { transform: scale(0.4); opacity: 1; }
+            100% { transform: scale(2.0); opacity: 0; }
+        }
+        .leaflet-control-attribution {
+            display: none !important;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <script>
+        var map = null;
+        var currentTileLayer = null;
+        var epicenterMarker = null;
+        var shockwaveCircle = null;
+        var currentIsDark = null;
+        var pendingUpdate = null;
+
+        // Note: Clean tile templates without {r} to prevent Leaflet template error
+        var lightTileUrl = 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png';
+        var darkTileUrl = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png';
+
+        function initMap() {
+            if (map) return;
+            try {
+                var mapContainer = document.getElementById('map');
+                if (!mapContainer) return;
+
+                map = L.map('map', {
+                    center: [-2.5489, 118.0149],
+                    zoom: 6,
+                    zoomControl: false,
+                    attributionControl: false,
+                    dragging: true,
+                    touchZoom: true,
+                    scrollWheelZoom: false,
+                    doubleClickZoom: false
+                });
+
+                // Attach ResizeObserver to handle container layout changes from Android Compose
+                if (window.ResizeObserver) {
+                    var ro = new ResizeObserver(function() {
+                        if (map) map.invalidateSize();
+                    });
+                    ro.observe(mapContainer);
+                }
+
+                // Periodic invalidation to handle any timing differences during WebView measurement
+                [50, 150, 300, 600, 1200].forEach(function(delay) {
+                    setTimeout(function() {
+                        if (map) map.invalidateSize();
+                    }, delay);
+                });
+
+                // If an update was queued before map initialization, apply it now
+                if (pendingUpdate) {
+                    var p = pendingUpdate;
+                    pendingUpdate = null;
+                    updateEpicenter(p.lat, p.lon, p.magnitude, p.isDark);
+                } else {
+                    setBasemap(false);
+                }
+            } catch (e) {
+                console.error("Leaflet init error: " + e);
+            }
+        }
+
+        function setBasemap(isDark) {
+            if (!map) return;
+            if (currentIsDark === isDark && currentTileLayer) return;
+            currentIsDark = isDark;
+
+            if (isDark) {
+                document.body.classList.add('dark-mode');
+            } else {
+                document.body.classList.remove('dark-mode');
+            }
+
+            if (currentTileLayer) {
+                map.removeLayer(currentTileLayer);
+            }
+
+            var primaryUrl = isDark ? darkTileUrl : lightTileUrl;
+            currentTileLayer = L.tileLayer(primaryUrl, {
+                subdomains: 'abcd',
+                maxZoom: 18,
+                attribution: '© CARTO'
+            });
+
+            currentTileLayer.on('tileerror', function(e) {
+                // If carto tile fails (e.g. DNS or block), try falling back to ESRI
+                if (e.tile && !e.tile._fallbackTried) {
+                    e.tile._fallbackTried = true;
+                    var z = e.coords.z, x = e.coords.x, y = e.coords.y;
+                    var alt = isDark ? 
+                        ('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/' + z + '/' + y + '/' + x) :
+                        ('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/' + z + '/' + y + '/' + x);
+                    e.tile.src = alt;
+                }
+            });
+
+            currentTileLayer.addTo(map);
+        }
+
+        function updateEpicenter(lat, lon, magnitude, isDark) {
+            if (!map) {
+                pendingUpdate = { lat: lat, lon: lon, magnitude: magnitude, isDark: isDark };
+                initMap();
+                return;
+            }
+
+            setBasemap(isDark);
+
+            var shockwaveRadius = Math.max(20000, Math.min(160000, magnitude * 18000));
+
+            // Shockwave Halo Circle
+            if (shockwaveCircle) {
+                shockwaveCircle.setLatLng([lat, lon]);
+                shockwaveCircle.setRadius(shockwaveRadius);
+            } else {
+                shockwaveCircle = L.circle([lat, lon], {
+                    radius: shockwaveRadius,
+                    color: '#e53935',
+                    fillColor: '#e53935',
+                    fillOpacity: 0.22,
+                    weight: 1.5
+                }).addTo(map);
+            }
+
+            // Beacon marker
+            var pulseIcon = L.divIcon({
+                className: 'pulse-container',
+                html: '<div class="pulse-beacon"></div>',
+                iconSize: [22, 22],
+                iconAnchor: [11, 11]
+            });
+
+            if (epicenterMarker) {
+                epicenterMarker.setLatLng([lat, lon]);
+            } else {
+                epicenterMarker = L.marker([lat, lon], { icon: pulseIcon }).addTo(map);
+            }
+
+            map.setView([lat, lon], 7);
+            map.invalidateSize();
+        }
+
+        // Initialize as soon as DOM is ready
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', initMap);
+        } else {
+            initMap();
+        }
+    </script>
+</body>
+</html>
